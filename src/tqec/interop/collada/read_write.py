@@ -16,12 +16,13 @@ from typing import BinaryIO, cast
 
 import collada
 import collada.source
+import collada.triangleset
 import numpy as np
 import numpy.typing as npt
 
 from tqec.computation.block_graph import BlockGraph, BlockKind, block_kind_from_str
 from tqec.computation.correlation import CorrelationSurface
-from tqec.computation.cube import CubeKind, LeafCubeKind
+from tqec.computation.cube import CubeKind, LeafCubeKind, PatchRotationKind
 from tqec.computation.pipe import PipeKind
 from tqec.interop.collada._geometry import (
     BlockGeometries,
@@ -234,10 +235,14 @@ def write_block_graph_to_dae_file(
 
         matrix = np.eye(4, dtype=np.float32)
         matrix[:3, 3] = scaled_position.as_array()
-        pop_directions = [
-            SignedDirection3D(pipe.direction, cube == pipe.u)
-            for pipe in block_graph.pipes_at(cube.position)
-        ]
+        pop_directions = (
+            []
+            if cube.kind is PatchRotationKind.PR
+            else [
+                SignedDirection3D(pipe.direction, cube == pipe.u)
+                for pipe in block_graph.pipes_at(cube.position)
+            ]
+        )
         base.add_block_instance(matrix, cube.kind, pop_directions)
 
     for pipe in block_graph.pipes:
@@ -437,6 +442,18 @@ class _BlockLibraryKey:
         return string
 
 
+def _map_template_material_to_color(material_name: str) -> TQECColor:
+    """Map a template material name to a TQECColor."""
+    name_lower = material_name.lower()
+    if "x" in name_lower or material_name == "ID14":
+        return TQECColor.X
+    if "z" in name_lower or material_name == "ID6":
+        return TQECColor.Z
+    if "y" in name_lower or material_name == "ID624":
+        return TQECColor.Y
+    return TQECColor.H
+
+
 class _BaseColladaData:
     def __init__(
         self,
@@ -534,16 +551,60 @@ class _BaseColladaData:
         self.geometry_nodes[face] = geom_node
         return geom_node
 
+    def _add_patch_rotation_geometry_nodes(self) -> list[collada.scene.GeometryNode]:
+        meshes = self.geometries.get_patch_rotation_meshes()
+        geom_nodes: list[collada.scene.GeometryNode] = []
+        for mesh_data in meshes:
+            positions = collada.source.FloatSource(
+                mesh_data.geometry_id + "_positions", mesh_data.vertices, ("X", "Y", "Z")
+            )
+            normals = collada.source.FloatSource(
+                mesh_data.geometry_id + "_normals", mesh_data.normals, ("X", "Y", "Z")
+            )
+            geom = collada.geometry.Geometry(
+                self.mesh, mesh_data.geometry_id, mesh_data.geometry_id, [positions, normals]
+            )
+            input_list = collada.source.InputList()
+            input_list.addInput(0, "VERTEX", "#" + positions.id)
+            input_list.addInput(0, "NORMAL", "#" + normals.id)
+            triset = geom.createTriangleSet(
+                mesh_data.indices, input_list, mesh_data.material_symbol
+            )
+            geom.primitives.append(triset)
+            self.mesh.geometries.append(geom)
+
+            color = _map_template_material_to_color(mesh_data.material_name)
+            material = self.materials[color]
+            inputs = [("UVSET0", "TEXCOORD", "0")]
+            mat_node = collada.scene.MaterialNode(mesh_data.material_symbol, material, inputs)
+            geom_node = collada.scene.GeometryNode(geom, [mat_node])
+            geom_nodes.append(geom_node)
+        return geom_nodes
+
     def _add_block_library_node(
         self,
         block_kind: BlockKind,
         pop_faces_at_directions: Iterable[SignedDirection3D] = (),
     ) -> _BlockLibraryKey:
-        pop_faces_at_directions = frozenset(pop_faces_at_directions) | self._pop_faces_at_directions
-        key = _BlockLibraryKey(block_kind, pop_faces_at_directions)
+        all_pop_directions = frozenset(pop_faces_at_directions) | self._pop_faces_at_directions
+        if block_kind is PatchRotationKind.PR:
+            if all_pop_directions:
+                raise NotImplementedError(
+                    "Popping faces at directions is not supported for PatchRotationKind.PR."
+                )
+            key = _BlockLibraryKey(block_kind)
+            if key in self.block_library:
+                return key
+            children = self._add_patch_rotation_geometry_nodes()
+            node = collada.scene.Node(str(key), children, name=str(key.kind))
+            self.mesh.nodes.append(node)
+            self.block_library[key] = node
+            return key
+
+        key = _BlockLibraryKey(block_kind, all_pop_directions)
         if key in self.block_library:
             return key
-        faces = self.geometries.get_geometry(block_kind, pop_faces_at_directions)
+        faces = self.geometries.get_geometry(block_kind, all_pop_directions)
         children = [self._add_face_geometry_node(face) for face in faces]
         key_str = str(key)
         node = collada.scene.Node(key_str, children, name=str(key.kind))

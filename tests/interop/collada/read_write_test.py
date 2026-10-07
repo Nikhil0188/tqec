@@ -2,13 +2,16 @@ import os
 import tempfile
 from pathlib import Path
 
+import collada
 import pytest
 
 from tqec.computation.block_graph import BlockGraph
-from tqec.computation.cube import LeafCubeKind, ZXCube
+from tqec.computation.cube import LeafCubeKind, PatchRotationKind, ZXCube
 from tqec.computation.pipe import PipeKind
 from tqec.gallery.cnot import cnot
+from tqec.gallery.patch_rotation import patch_rotation, spatially_aligned_patch_rotation
 from tqec.gallery.three_cnots import three_cnots
+from tqec.interop.collada._geometry import BlockGeometries
 from tqec.utils.enums import Basis
 from tqec.utils.position import Position3D
 
@@ -172,3 +175,84 @@ def test_dae_roundtrip_preserves_y_cube_position_above_origin():
     y_cubes = [c for c in g2.cubes if c.kind is LeafCubeKind.Y_HALF_CUBE]
     assert len(y_cubes) == 1
     assert y_cubes[0].position == Position3D(1, 1, 3)
+
+
+def test_patch_rotation_collada_export() -> None:
+    g = patch_rotation()
+    with tempfile.NamedTemporaryFile(suffix=".dae", delete=False) as f:
+        g.to_dae_file(f.name)
+        mesh = collada.Collada(f.name)
+        geom_ids = [geom.id for geom in mesh.geometries]
+        assert "ID645" in geom_ids
+        assert "ID651" in geom_ids
+        assert "ID657" in geom_ids
+
+        node_names = [n.name for n in mesh.nodes]
+        assert "PR" in node_names
+        pr_node = next(n for n in mesh.nodes if n.name == "PR")
+        assert len(pr_node.children) == 3
+
+        materials_by_geom = {
+            c.geometry.id: [mn.target.id for mn in c.materials] for c in pr_node.children
+        }
+        assert materials_by_geom["ID645"] == ["X_material"]
+        assert materials_by_geom["ID651"] == ["Z_material"]
+        assert materials_by_geom["ID657"] == ["H_material"]
+    os.remove(f.name)
+
+
+def test_spatially_aligned_patch_rotation_collada_export() -> None:
+    g = spatially_aligned_patch_rotation()
+    with tempfile.NamedTemporaryFile(suffix=".dae", delete=False) as f:
+        g.to_dae_file(f.name)
+        mesh = collada.Collada(f.name)
+        geom_ids = [geom.id for geom in mesh.geometries]
+        assert "ID645" in geom_ids
+        assert "ID651" in geom_ids
+        assert "ID657" in geom_ids
+
+        node_names = [n.name for n in mesh.nodes]
+        assert "PR" in node_names
+    os.remove(f.name)
+
+
+@pytest.mark.parametrize("obs_basis", [Basis.X, Basis.Z])
+def test_patch_rotation_collada_write_read_roundtrip(obs_basis: Basis) -> None:
+    g = patch_rotation(obs_basis)
+    with tempfile.NamedTemporaryFile(suffix=".dae", delete=False) as f:
+        g.to_dae_file(f.name)
+        g2 = BlockGraph.from_dae_file(f.name)
+        assert g2 == g
+    os.remove(f.name)
+
+
+@pytest.mark.parametrize("obs_basis", [Basis.X, Basis.Z])
+def test_spatially_aligned_patch_rotation_collada_write_read_roundtrip(obs_basis: Basis) -> None:
+    g = spatially_aligned_patch_rotation(obs_basis)
+    with tempfile.NamedTemporaryFile(suffix=".dae", delete=False) as f:
+        g.to_dae_file(f.name)
+        g2 = BlockGraph.from_dae_file(f.name)
+        assert g2 == g
+    os.remove(f.name)
+
+
+def test_patch_rotation_pop_faces_not_implemented() -> None:
+    g = patch_rotation()
+    with tempfile.NamedTemporaryFile(suffix=".dae", delete=False) as f:
+        temp_file_name = f.name
+    try:
+        with pytest.raises(
+            NotImplementedError,
+            match=r"Popping faces at directions is not supported for PatchRotationKind\.PR",
+        ):
+            g.to_dae_file(temp_file_name, pop_faces_at_directions=["+X"])
+    finally:
+        if os.path.exists(temp_file_name):
+            os.remove(temp_file_name)
+
+    geometries = BlockGeometries()
+    with pytest.raises(
+        NotImplementedError,
+        match=r"PatchRotationKind\.PR geometry is mesh-based",
+    ):
+        geometries.get_geometry(PatchRotationKind.PR)

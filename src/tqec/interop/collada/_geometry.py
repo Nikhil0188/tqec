@@ -2,20 +2,93 @@
 
 from __future__ import annotations
 
+import functools
+import pathlib
 from dataclasses import astuple, dataclass, field
 from typing import TYPE_CHECKING
 
+import collada
 import numpy as np
 import numpy.typing as npt
 
-from tqec.computation.cube import LeafCubeKind, ZXCube
+from tqec.computation.cube import LeafCubeKind, PatchRotationKind, ZXCube
 from tqec.computation.pipe import PipeKind
 from tqec.interop.color import TQECColor
 from tqec.utils.enums import Basis
+from tqec.utils.exceptions import TQECError
 from tqec.utils.position import Direction3D, FloatPosition3D, SignedDirection3D
 
 if TYPE_CHECKING:
     from tqec.computation.block_graph import BlockKind
+
+
+@dataclass(frozen=True)
+class PatchRotationMesh:
+    """A triangle mesh representing part of a patch rotation block.
+
+    Attributes:
+        geometry_id: The identifier of the geometry in the COLLADA model.
+        vertices: 1D array of vertex coordinates (flattened from (N, 3)).
+        normals: 1D array of normal vectors (flattened from (N, 3)).
+        indices: 1D array of triangle vertex indices.
+        material_symbol: The material symbol used in the COLLADA geometry.
+        material_name: The name of the template material bound to the geometry.
+
+    """
+
+    geometry_id: str
+    vertices: npt.NDArray[np.float64]
+    normals: npt.NDArray[np.float64]
+    indices: npt.NDArray[np.int_]
+    material_symbol: str
+    material_name: str
+
+
+def _get_template_dae_path() -> pathlib.Path:
+    repo_path = pathlib.Path(__file__).resolve().parents[4] / "assets" / "template.dae"
+    if repo_path.is_file():
+        return repo_path
+    cwd_path = pathlib.Path.cwd() / "assets" / "template.dae"
+    if cwd_path.is_file():
+        return cwd_path
+    raise FileNotFoundError(f"Cannot find template.dae at {repo_path} or {cwd_path}")
+
+
+@functools.cache
+def load_patch_rotation_meshes() -> list[PatchRotationMesh]:
+    """Load the patch rotation geometry meshes from assets/template.dae."""
+    template_path = _get_template_dae_path()
+    mesh = collada.Collada(str(template_path))
+    pr_nodes = [n for n in mesh.nodes if n.name == "pr" or n.id == "ID644"]
+    if not pr_nodes:
+        raise TQECError(f"No 'pr' node found in template COLLADA file at {template_path}.")
+    pr_node = pr_nodes[0]
+    meshes: list[PatchRotationMesh] = []
+    for child in pr_node.children:
+        if not isinstance(child, collada.scene.GeometryNode):
+            continue
+        geom = child.geometry
+        if not geom.primitives:
+            continue
+        triset = geom.primitives[0]
+        mat_symbol = "Material2"
+        mat_name = "material"
+        if child.materials:
+            mat_node = child.materials[0]
+            mat_symbol = mat_node.symbol
+            if mat_node.target is not None:
+                mat_name = getattr(mat_node.target, "name", mat_node.target.id)
+        meshes.append(
+            PatchRotationMesh(
+                geometry_id=geom.id,
+                vertices=np.asarray(triset.vertex, dtype=np.float64).flatten(),
+                normals=np.asarray(triset.normal, dtype=np.float64).flatten(),
+                indices=np.asarray(triset.index, dtype=np.int_).flatten(),
+                material_symbol=mat_symbol,
+                material_name=mat_name,
+            )
+        )
+    return meshes
 
 
 @dataclass(frozen=True)
@@ -103,8 +176,21 @@ class BlockGeometries:
         pop_faces_at_directions: frozenset[SignedDirection3D] = frozenset(),
     ) -> list[Face]:
         """Get the geometry of a block kind, possibly with some faces popped out."""
+        if kind is PatchRotationKind.PR:
+            if pop_faces_at_directions:
+                raise NotImplementedError(
+                    "Popping faces at directions is not supported for PatchRotationKind.PR."
+                )
+            raise NotImplementedError(
+                "PatchRotationKind.PR geometry is mesh-based and "
+                "cannot be converted to Face objects."
+            )
         faces = self.geometries[kind]
         return [face for face in faces if face.normal_direction not in pop_faces_at_directions]
+
+    def get_patch_rotation_meshes(self) -> list[PatchRotationMesh]:
+        """Get the mesh geometries for patch rotation blocks."""
+        return load_patch_rotation_meshes()
 
     def _load_zx_cube_geometries(self) -> None:
         """Geometries for zxx, xzx, xxz, xzz, zxz, zzx cubes."""
